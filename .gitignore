@@ -3,3 +3,8 @@ node_modules/
 *.log
 session.json
 report.txt
+queue.txt
+added.txt
+already-exists.txt
+not-found.txt
+errors.txt

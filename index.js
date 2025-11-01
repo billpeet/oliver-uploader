@@ -8,6 +8,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const SESSION_FILE = join(__dirname, "session.json");
+const QUEUE_FILE = join(__dirname, "queue.txt");
+const ADDED_FILE = join(__dirname, "added.txt");
+const ALREADY_EXISTS_FILE = join(__dirname, "already-exists.txt");
+const NOT_FOUND_FILE = join(__dirname, "not-found.txt");
+const ERRORS_FILE = join(__dirname, "errors.txt");
+
 const BASE_URL = "https://oneschoolglobal.softlinkhosting.com.au";
 const SMART_CATALOG_URL = `${BASE_URL}/oliver/cataloguing/smartCataloguing.do`;
 const PERMISSION_DENIED_SELECTOR =
@@ -47,6 +53,113 @@ function registerPageEventHandlers(targetPage) {
   });
 
   pagesWithHandlers.add(targetPage);
+}
+
+// Queue management functions
+function readLines(filePath) {
+  if (!existsSync(filePath)) {
+    return [];
+  }
+  const content = readFileSync(filePath, "utf-8");
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function writeLines(filePath, lines) {
+  writeFileSync(filePath, lines.join("\n") + "\n", "utf-8");
+}
+
+function appendLine(filePath, line, errorMessage = null) {
+  const content = errorMessage ? `${line} # ${errorMessage}` : line;
+  const existing = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
+  writeFileSync(filePath, existing + content + "\n", "utf-8");
+}
+
+function removeFirstLineFromQueue() {
+  const queue = readLines(QUEUE_FILE);
+  if (queue.length > 0) {
+    queue.shift(); // Remove first item
+    writeLines(QUEUE_FILE, queue);
+  }
+}
+
+function getProcessedIsbns() {
+  // Read all successfully processed ISBNs (excluding errors.txt for retry)
+  const added = readLines(ADDED_FILE);
+  const alreadyExists = readLines(ALREADY_EXISTS_FILE);
+  const notFound = readLines(NOT_FOUND_FILE);
+  return new Set([...added, ...alreadyExists, ...notFound]);
+}
+
+function initializeQueue(inputIsbns) {
+  const processedIsbns = getProcessedIsbns();
+  const existingQueue = readLines(QUEUE_FILE);
+
+  // Clean existing queue of already-processed ISBNs
+  const cleanedQueue = existingQueue.filter(isbn => !processedIsbns.has(isbn));
+
+  if (cleanedQueue.length < existingQueue.length) {
+    console.log(`Removed ${existingQueue.length - cleanedQueue.length} already-processed ISBN(s) from queue`);
+  }
+
+  if (cleanedQueue.length > 0) {
+    console.log(`Found existing queue with ${cleanedQueue.length} ISBN(s)`);
+
+    // Filter input ISBNs to only include those not already processed and not in queue
+    const newIsbns = inputIsbns.filter(isbn =>
+      !processedIsbns.has(isbn) && !cleanedQueue.includes(isbn)
+    );
+
+    if (newIsbns.length > 0) {
+      console.log(`Adding ${newIsbns.length} new ISBN(s) to queue`);
+      const updatedQueue = [...cleanedQueue, ...newIsbns];
+      writeLines(QUEUE_FILE, updatedQueue);
+      return updatedQueue;
+    } else {
+      console.log("No new ISBNs to add to queue");
+      if (cleanedQueue.length !== existingQueue.length) {
+        writeLines(QUEUE_FILE, cleanedQueue);
+      }
+      return cleanedQueue;
+    }
+  } else {
+    // No existing queue or it was empty after cleaning
+    const newIsbns = inputIsbns.filter(isbn => !processedIsbns.has(isbn));
+
+    if (newIsbns.length < inputIsbns.length) {
+      console.log(`Skipped ${inputIsbns.length - newIsbns.length} already-processed ISBN(s)`);
+    }
+
+    if (newIsbns.length > 0) {
+      console.log(`Creating new queue with ${newIsbns.length} ISBN(s)`);
+      writeLines(QUEUE_FILE, newIsbns);
+      return newIsbns;
+    } else {
+      console.log("All ISBNs have already been processed");
+      return [];
+    }
+  }
+}
+
+function recordResult(isbn, status, errorMessage = null) {
+  switch (status) {
+    case "ADDED":
+      appendLine(ADDED_FILE, isbn);
+      break;
+    case "ALREADY_EXISTS":
+      appendLine(ALREADY_EXISTS_FILE, isbn);
+      break;
+    case "NOT_FOUND":
+      appendLine(NOT_FOUND_FILE, isbn);
+      break;
+    case "ERROR":
+    case "UNKNOWN":
+      appendLine(ERRORS_FILE, isbn, errorMessage || "Unknown error");
+      break;
+  }
+  removeFirstLineFromQueue();
 }
 
 async function gotoAndWait(url, options = {}) {
@@ -468,10 +581,20 @@ async function searchSmartCataloguing(isbn, attempt = 1) {
   await page.fill("#smartCatSearchTerm", isbn);
   await page.click("#smartCatSearchButton");
 
+  // Wait for the search to complete - the status message changes from "Search, please wait..." to the actual result
   try {
-    await page.waitForSelector("#smartCatFoundMsg", { timeout: 15000 });
+    await page.waitForFunction(
+      () => {
+        const msgElement = document.querySelector("#smartCatFoundMsg") || document.querySelector(".smartCatFoundMsg");
+        if (!msgElement) return false;
+        const text = msgElement.innerText.trim().toLowerCase();
+        // Wait until it's NOT the loading message anymore
+        return text && !text.includes("search") && !text.includes("please wait");
+      },
+      { timeout: 15000 }
+    );
   } catch (_) {
-    // If message didn't appear, allow a short grace period.
+    // If the status message doesn't change, allow a short grace period
     await page.waitForTimeout(1500);
   }
 
@@ -511,7 +634,9 @@ async function processISBN(isbn) {
     const navSuccess = await navigateToSmartCataloguing();
     if (!navSuccess) {
       console.log("❌ Failed to navigate to Smart Cataloguing page");
-      return { isbn, status: "ERROR", error: "Navigation failed" };
+      const result = { isbn, status: "ERROR", error: "Navigation failed" };
+      recordResult(isbn, result.status, result.error);
+      return result;
     }
 
     const searchReady = await searchSmartCataloguing(isbn);
@@ -519,7 +644,9 @@ async function processISBN(isbn) {
       console.log(
         "❌ Unable to complete search after session refresh attempts"
       );
-      return { isbn, status: "ERROR", error: "Search failed after re-login" };
+      const result = { isbn, status: "ERROR", error: "Search failed after re-login" };
+      recordResult(isbn, result.status, result.error);
+      return result;
     }
 
     const statusMessageHandle =
@@ -532,7 +659,9 @@ async function processISBN(isbn) {
 
     if (statusText.toLowerCase().includes("no matching resource")) {
       console.log("❌ ISBN not found - no matching resource");
-      return { isbn, status: "NOT_FOUND" };
+      const result = { isbn, status: "NOT_FOUND" };
+      recordResult(isbn, result.status);
+      return result;
     }
 
     if (statusText.toLowerCase().includes("found matching resource")) {
@@ -541,7 +670,9 @@ async function processISBN(isbn) {
         const isDisabled = await saveButton.isDisabled();
         if (isDisabled) {
           console.log("⏭️  Resource already exists in catalog");
-          return { isbn, status: "ALREADY_EXISTS" };
+          const result = { isbn, status: "ALREADY_EXISTS" };
+          recordResult(isbn, result.status);
+          return result;
         }
 
         console.log("✅ Resource found and not yet catalogued, saving...");
@@ -555,15 +686,21 @@ async function processISBN(isbn) {
 
         await page.waitForTimeout(1000);
         console.log("✅ Resource saved successfully!");
-        return { isbn, status: "ADDED" };
+        const result = { isbn, status: "ADDED" };
+        recordResult(isbn, result.status);
+        return result;
       }
 
       console.log("⚠️  Found resource but save control missing");
-      return { isbn, status: "UNKNOWN" };
+      const result = { isbn, status: "UNKNOWN" };
+      recordResult(isbn, result.status, "Save button not found");
+      return result;
     }
 
-    console.log("⚠️  Warning: No status message after search");
-    return { isbn, status: "UNKNOWN" };
+    console.log("⚠️  Warning: No status message after search:", statusText);
+    const result = { isbn, status: "UNKNOWN" };
+    recordResult(isbn, result.status, "No status message");
+    return result;
   } catch (error) {
     console.error(`❌ Error processing ISBN ${isbn}: ${error.message}`);
     if (page?.isClosed?.()) {
@@ -571,7 +708,9 @@ async function processISBN(isbn) {
         "   → Page closed unexpectedly; it will be recreated on the next iteration."
       );
     }
-    return { isbn, status: "ERROR", error: error.message };
+    const result = { isbn, status: "ERROR", error: error.message };
+    recordResult(isbn, result.status, result.error);
+    return result;
   }
 }
 
@@ -592,7 +731,9 @@ async function runOliverAutomation(isbns) {
     process.exit(1);
   }
 
-  console.log(`Processing ${isbns.length} ISBN(s)...`);
+  // Initialize queue with input ISBNs
+  const queue = initializeQueue(isbns);
+  console.log(`\nTotal ISBNs in queue: ${queue.length}`);
 
   const headless =
     process.env.HEADLESS === "true" || process.env.HEADLESS === "1";
@@ -635,9 +776,23 @@ async function runOliverAutomation(isbns) {
     }
 
     const results = [];
-    for (let i = 0; i < isbns.length; i++) {
-      console.log(`\nProgress: ${i + 1}/${isbns.length}`);
-      const result = await processISBN(isbns[i]);
+    const totalToProcess = queue.length;
+    let processed = 0;
+
+    // Process ISBNs from queue (queue will be updated as we go)
+    while (true) {
+      const currentQueue = readLines(QUEUE_FILE);
+      if (currentQueue.length === 0) {
+        break; // Queue is empty
+      }
+
+      const isbn = currentQueue[0]; // Always process the first item
+      processed++;
+
+      const remaining = currentQueue.length - 1;
+      console.log(`\nProgress: ${processed}/${totalToProcess} (${remaining} remaining in queue)`);
+
+      const result = await processISBN(isbn);
       results.push(result);
     }
 
@@ -645,16 +800,18 @@ async function runOliverAutomation(isbns) {
     console.log("PROCESSING COMPLETE - REPORT");
     console.log("=".repeat(70));
 
-    const added = results.filter((r) => r.status === "ADDED");
-    const alreadyExists = results.filter((r) => r.status === "ALREADY_EXISTS");
-    const notFound = results.filter((r) => r.status === "NOT_FOUND");
-    const errors = results.filter((r) => r.status === "ERROR");
-    const unknown = results.filter((r) => r.status === "UNKNOWN");
+    // Read results from files
+    const added = readLines(ADDED_FILE);
+    const alreadyExists = readLines(ALREADY_EXISTS_FILE);
+    const notFound = readLines(NOT_FOUND_FILE);
+    const errorLines = existsSync(ERRORS_FILE)
+      ? readFileSync(ERRORS_FILE, "utf-8").split(/\r?\n/).filter(l => l.trim())
+      : [];
 
     console.log(`\n✅ ADDED (${added.length}):`);
     if (added.length > 0) {
-      added.forEach((r) => {
-        console.log(`   - ${r.isbn}`);
+      added.forEach((isbn) => {
+        console.log(`   - ${isbn}`);
       });
     } else {
       console.log("   None");
@@ -662,8 +819,8 @@ async function runOliverAutomation(isbns) {
 
     console.log(`\n⏭️  ALREADY EXISTS (${alreadyExists.length}):`);
     if (alreadyExists.length > 0) {
-      alreadyExists.forEach((r) => {
-        console.log(`   - ${r.isbn}`);
+      alreadyExists.forEach((isbn) => {
+        console.log(`   - ${isbn}`);
       });
     } else {
       console.log("   None");
@@ -671,30 +828,25 @@ async function runOliverAutomation(isbns) {
 
     console.log(`\n❌ NOT FOUND (${notFound.length}):`);
     if (notFound.length > 0) {
-      notFound.forEach((r) => {
-        console.log(`   - ${r.isbn}`);
+      notFound.forEach((isbn) => {
+        console.log(`   - ${isbn}`);
       });
     } else {
       console.log("   None");
     }
 
-    if (errors.length > 0) {
-      console.log(`\n❌ ERRORS (${errors.length}):`);
-      errors.forEach((r) => {
-        console.log(`   - ${r.isbn}: ${r.error}`);
+    if (errorLines.length > 0) {
+      console.log(`\n❌ ERRORS (${errorLines.length}):`);
+      errorLines.forEach((line) => {
+        console.log(`   - ${line}`);
       });
     }
 
-    if (unknown.length > 0) {
-      console.log(`\n⚠️  UNKNOWN (${unknown.length}):`);
-      unknown.forEach((r) => {
-        console.log(`   - ${r.isbn}`);
-      });
-    }
+    const totalProcessed = added.length + alreadyExists.length + notFound.length + errorLines.length;
 
     console.log("\n=".repeat(70));
     console.log(
-      `Total: ${results.length} | Added: ${added.length} | Already Exists: ${alreadyExists.length} | Not Found: ${notFound.length}`
+      `Total: ${totalProcessed} | Added: ${added.length} | Already Exists: ${alreadyExists.length} | Not Found: ${notFound.length}`
     );
     console.log("=".repeat(70));
 
@@ -703,39 +855,32 @@ async function runOliverAutomation(isbns) {
 Generated: ${new Date().toLocaleString()}
 
 SUMMARY:
-- Total ISBNs Processed: ${results.length}
+- Total ISBNs Processed: ${totalProcessed}
 - Added: ${added.length}
 - Already Exists: ${alreadyExists.length}
 - Not Found: ${notFound.length}
-- Errors: ${errors.length}
-- Unknown: ${unknown.length}
+- Errors: ${errorLines.length}
 
 ADDED (${added.length}):
-${added.map((r) => r.isbn).join("\n") || "None"}
+${added.join("\n") || "None"}
 
 ALREADY EXISTS (${alreadyExists.length}):
-${alreadyExists.map((r) => r.isbn).join("\n") || "None"}
+${alreadyExists.join("\n") || "None"}
 
 NOT FOUND (${notFound.length}):
-${notFound.map((r) => r.isbn).join("\n") || "None"}
+${notFound.join("\n") || "None"}
 
-${
-  errors.length > 0
-    ? `ERRORS (${errors.length}):\n${errors
-        .map((r) => `${r.isbn}: ${r.error}`)
-        .join("\n")}`
-    : ""
-}
-
-${
-  unknown.length > 0
-    ? `UNKNOWN (${unknown.length}):\n${unknown.map((r) => r.isbn).join("\n")}`
-    : ""
-}
+${errorLines.length > 0 ? `ERRORS (${errorLines.length}):\n${errorLines.join("\n")}` : ""}
 `;
 
     writeFileSync(reportPath, reportContent);
     console.log(`\n📄 Report saved to: ${reportPath}`);
+    console.log("\nResult files:");
+    console.log(`  - Queue: ${QUEUE_FILE}`);
+    console.log(`  - Added: ${ADDED_FILE}`);
+    console.log(`  - Already Exists: ${ALREADY_EXISTS_FILE}`);
+    console.log(`  - Not Found: ${NOT_FOUND_FILE}`);
+    console.log(`  - Errors: ${ERRORS_FILE}`);
 
     console.log("\nBrowser will remain open. Close it manually when done.");
   } catch (error) {
