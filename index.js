@@ -98,18 +98,24 @@ function initializeQueue(inputIsbns) {
   const existingQueue = readLines(QUEUE_FILE);
 
   // Clean existing queue of already-processed ISBNs
-  const cleanedQueue = existingQueue.filter(isbn => !processedIsbns.has(isbn));
+  const cleanedQueue = existingQueue.filter(
+    (isbn) => !processedIsbns.has(isbn)
+  );
 
   if (cleanedQueue.length < existingQueue.length) {
-    console.log(`Removed ${existingQueue.length - cleanedQueue.length} already-processed ISBN(s) from queue`);
+    console.log(
+      `Removed ${
+        existingQueue.length - cleanedQueue.length
+      } already-processed ISBN(s) from queue`
+    );
   }
 
   if (cleanedQueue.length > 0) {
     console.log(`Found existing queue with ${cleanedQueue.length} ISBN(s)`);
 
     // Filter input ISBNs to only include those not already processed and not in queue
-    const newIsbns = inputIsbns.filter(isbn =>
-      !processedIsbns.has(isbn) && !cleanedQueue.includes(isbn)
+    const newIsbns = inputIsbns.filter(
+      (isbn) => !processedIsbns.has(isbn) && !cleanedQueue.includes(isbn)
     );
 
     if (newIsbns.length > 0) {
@@ -126,10 +132,14 @@ function initializeQueue(inputIsbns) {
     }
   } else {
     // No existing queue or it was empty after cleaning
-    const newIsbns = inputIsbns.filter(isbn => !processedIsbns.has(isbn));
+    const newIsbns = inputIsbns.filter((isbn) => !processedIsbns.has(isbn));
 
     if (newIsbns.length < inputIsbns.length) {
-      console.log(`Skipped ${inputIsbns.length - newIsbns.length} already-processed ISBN(s)`);
+      console.log(
+        `Skipped ${
+          inputIsbns.length - newIsbns.length
+        } already-processed ISBN(s)`
+      );
     }
 
     if (newIsbns.length > 0) {
@@ -283,7 +293,7 @@ async function loginThroughPopup() {
     console.log(`   → Page load timeout: ${error.message}`);
   }
 
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(500);
   console.log("   → Checking login status...");
 
   const logoutVisible = await page
@@ -418,7 +428,7 @@ async function attemptMenuSmartCatalog(attempt = 1) {
       console.log("   → Login successful, already on welcome page.");
     }
     console.log("   → Waiting for page to fully initialize...");
-    await page.waitForTimeout(3000); // Give page time to fully load and initialize menus
+    await page.waitForTimeout(1000); // Give page time to fully load and initialize menus
   }
 
   console.log("   → Checking for cataloguing menu...");
@@ -521,10 +531,7 @@ async function attemptMenuSmartCatalog(attempt = 1) {
       console.log("   → Login dialog failed during menu fallback.");
       return attemptMenuSmartCatalog(attempt + 1);
     }
-    const postLoginDirect = await attemptDirectSmartCatalog(3);
-    if (postLoginDirect) {
-      return true;
-    }
+    // After login, retry menu navigation instead of direct
     return attemptMenuSmartCatalog(attempt + 1);
   }
 
@@ -550,10 +557,7 @@ async function attemptMenuSmartCatalog(attempt = 1) {
 }
 
 async function ensureSmartCataloguingPage() {
-  const directSuccess = await attemptDirectSmartCatalog();
-  if (directSuccess) {
-    return true;
-  }
+  // Skip direct navigation - it never works after login, always use menu method
   return attemptMenuSmartCatalog();
 }
 
@@ -567,6 +571,7 @@ async function searchSmartCataloguing(isbn, attempt = 1) {
   }
 
   try {
+    console.log("   → Waiting for search field to be available...");
     await page.waitForSelector("#smartCatSearchTerm", { timeout: 15000 });
   } catch {
     console.log("   → Search field unavailable, reloading page...");
@@ -581,17 +586,55 @@ async function searchSmartCataloguing(isbn, attempt = 1) {
   await page.fill("#smartCatSearchTerm", isbn);
   await page.click("#smartCatSearchButton");
 
-  // Wait for the search to complete - the status message changes from "Search, please wait..." to the actual result
+  // Check for and dismiss the modal dialog that may appear on subsequent searches
+  try {
+    const modalDialog = await page.waitForSelector("[id^='modalPopupId_']", {
+      timeout: 1000,
+    });
+    if (modalDialog) {
+      console.log("   → Modal dialog appeared, dismissing...");
+      const okButton = await page.$("#dialogButton_OK");
+      if (okButton) {
+        await okButton.click();
+        console.log("   → Modal dismissed");
+        await page.waitForTimeout(300);
+      }
+    }
+  } catch (_) {
+    // No modal appeared, continue
+  }
+
+  // Wait for the search to start - the message should change to "Search, please wait..."
+  try {
+    console.log("   → Waiting for search to start...");
+    await page.waitForFunction(
+      () => {
+        const msgElement =
+          document.querySelector("#smartCatFoundMsg") ||
+          document.querySelector(".smartCatFoundMsg");
+        if (!msgElement) return false;
+        const text = msgElement.innerText.trim();
+        return text && !text.includes("Search, please wait...");
+      },
+      { timeout: 2000 }
+    );
+  } catch (_) {
+    // Continue if loading message doesn't appear
+  }
+
+  // Now wait for the search to complete - the status message changes to the actual result
   try {
     await page.waitForFunction(
       () => {
-        const msgElement = document.querySelector("#smartCatFoundMsg") || document.querySelector(".smartCatFoundMsg");
+        const msgElement =
+          document.querySelector("#smartCatFoundMsg") ||
+          document.querySelector(".smartCatFoundMsg");
         if (!msgElement) return false;
-        const text = msgElement.innerText.trim().toLowerCase();
+        const text = msgElement.innerText.trim();
         // Wait until it's NOT the loading message anymore
-        return text && !text.includes("search") && !text.includes("please wait");
+        return text && !text.includes("Search, please wait...");
       },
-      { timeout: 15000 }
+      { timeout: 10000 }
     );
   } catch (_) {
     // If the status message doesn't change, allow a short grace period
@@ -625,18 +668,21 @@ async function searchSmartCataloguing(isbn, attempt = 1) {
   return stillOnSmartCataloguing;
 }
 
-async function processISBN(isbn) {
+async function processISBN(isbn, skipNavigation = false) {
   console.log(`\n${"=".repeat(50)}`);
   console.log(`Processing ISBN: ${isbn}`);
   console.log("=".repeat(50));
 
   try {
-    const navSuccess = await navigateToSmartCataloguing();
-    if (!navSuccess) {
-      console.log("❌ Failed to navigate to Smart Cataloguing page");
-      const result = { isbn, status: "ERROR", error: "Navigation failed" };
-      recordResult(isbn, result.status, result.error);
-      return result;
+    // Only navigate if it's the first ISBN or if explicitly requested
+    if (!skipNavigation) {
+      const navSuccess = await navigateToSmartCataloguing();
+      if (!navSuccess) {
+        console.log("❌ Failed to navigate to Smart Cataloguing page");
+        const result = { isbn, status: "ERROR", error: "Navigation failed" };
+        recordResult(isbn, result.status, result.error);
+        return result;
+      }
     }
 
     const searchReady = await searchSmartCataloguing(isbn);
@@ -644,7 +690,11 @@ async function processISBN(isbn) {
       console.log(
         "❌ Unable to complete search after session refresh attempts"
       );
-      const result = { isbn, status: "ERROR", error: "Search failed after re-login" };
+      const result = {
+        isbn,
+        status: "ERROR",
+        error: "Search failed after re-login",
+      };
       recordResult(isbn, result.status, result.error);
       return result;
     }
@@ -678,13 +728,30 @@ async function processISBN(isbn) {
         console.log("✅ Resource found and not yet catalogued, saving...");
         await saveButton.click();
 
+        // Check for and dismiss the modal dialog that may appear after saving
+        try {
+          const modalDialog = await page.waitForSelector("[id^='modalPopupId_']", {
+            timeout: 2000,
+          });
+          if (modalDialog) {
+            console.log("   → Save confirmation modal appeared, dismissing...");
+            const okButton = await page.$("#dialogButton_OK");
+            if (okButton) {
+              await okButton.click();
+              console.log("   → Modal dismissed");
+              await page.waitForTimeout(500);
+            }
+          }
+        } catch (_) {
+          // No modal appeared, continue
+        }
+
         try {
           await page.waitForLoadState("load", { timeout: 8000 });
         } catch (_) {
           // Ignore load-state timeouts; data saves even if background polling continues.
         }
 
-        await page.waitForTimeout(1000);
         console.log("✅ Resource saved successfully!");
         const result = { isbn, status: "ADDED" };
         recordResult(isbn, result.status);
@@ -734,6 +801,12 @@ async function runOliverAutomation(isbns) {
   // Initialize queue with input ISBNs
   const queue = initializeQueue(isbns);
   console.log(`\nTotal ISBNs in queue: ${queue.length}`);
+
+  // Skip processing if queue is empty
+  if (queue.length === 0) {
+    console.log("\n✅ No ISBNs to process. Exiting.");
+    return;
+  }
 
   const headless =
     process.env.HEADLESS === "true" || process.env.HEADLESS === "1";
@@ -790,22 +863,27 @@ async function runOliverAutomation(isbns) {
       processed++;
 
       const remaining = currentQueue.length - 1;
-      console.log(`\nProgress: ${processed}/${totalToProcess} (${remaining} remaining in queue)`);
+      console.log(
+        `\nProgress: ${processed}/${totalToProcess} (${remaining} remaining in queue)`
+      );
 
-      const result = await processISBN(isbn);
+      // Skip navigation since we're already on Smart Cataloguing page
+      const result = await processISBN(isbn, true);
       results.push(result);
     }
 
-    console.log("\n=".repeat(70));
+    console.log("\n" + "=".repeat(70));
     console.log("PROCESSING COMPLETE - REPORT");
-    console.log("=".repeat(70));
+    console.log("\n" + "=".repeat(70));
 
     // Read results from files
     const added = readLines(ADDED_FILE);
     const alreadyExists = readLines(ALREADY_EXISTS_FILE);
     const notFound = readLines(NOT_FOUND_FILE);
     const errorLines = existsSync(ERRORS_FILE)
-      ? readFileSync(ERRORS_FILE, "utf-8").split(/\r?\n/).filter(l => l.trim())
+      ? readFileSync(ERRORS_FILE, "utf-8")
+          .split(/\r?\n/)
+          .filter((l) => l.trim())
       : [];
 
     console.log(`\n✅ ADDED (${added.length}):`);
@@ -842,13 +920,14 @@ async function runOliverAutomation(isbns) {
       });
     }
 
-    const totalProcessed = added.length + alreadyExists.length + notFound.length + errorLines.length;
+    const totalProcessed =
+      added.length + alreadyExists.length + notFound.length + errorLines.length;
 
-    console.log("\n=".repeat(70));
+    console.log("\n" + "=".repeat(70));
     console.log(
       `Total: ${totalProcessed} | Added: ${added.length} | Already Exists: ${alreadyExists.length} | Not Found: ${notFound.length}`
     );
-    console.log("=".repeat(70));
+    // console.log("=".repeat(70));
 
     const reportPath = join(__dirname, "report.txt");
     const reportContent = `Oliver Library Upload Report
@@ -870,7 +949,11 @@ ${alreadyExists.join("\n") || "None"}
 NOT FOUND (${notFound.length}):
 ${notFound.join("\n") || "None"}
 
-${errorLines.length > 0 ? `ERRORS (${errorLines.length}):\n${errorLines.join("\n")}` : ""}
+${
+  errorLines.length > 0
+    ? `ERRORS (${errorLines.length}):\n${errorLines.join("\n")}`
+    : ""
+}
 `;
 
     writeFileSync(reportPath, reportContent);
@@ -881,8 +964,9 @@ ${errorLines.length > 0 ? `ERRORS (${errorLines.length}):\n${errorLines.join("\n
     console.log(`  - Already Exists: ${ALREADY_EXISTS_FILE}`);
     console.log(`  - Not Found: ${NOT_FOUND_FILE}`);
     console.log(`  - Errors: ${ERRORS_FILE}`);
-
-    console.log("\nBrowser will remain open. Close it manually when done.");
+    if (browser) {
+      await browser.close();
+    }
   } catch (error) {
     console.error("Error during automation:", error.message);
     console.error("Stack trace:", error.stack);
