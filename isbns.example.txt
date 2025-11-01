@@ -2,10 +2,10 @@
 # Lines starting with # are comments and will be ignored
 # You can use this as a template for your own ISBN list
 
-# Harry Potter series (examples)
-9780545139700
-9780439139595
-9780545162074
+# Example ISBNs
+9780857980373
+9781471117008
+9780753725634
 
 # You can also separate ISBNs with commas or semicolons
 # 9780545139700,9780439139595,9780545162074

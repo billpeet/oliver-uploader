@@ -18,24 +18,35 @@ let browser;
 let context;
 let page;
 
+// Track pages that already have event handlers registered
+const pagesWithHandlers = new WeakSet();
+
 function registerPageEventHandlers(targetPage) {
   if (!targetPage) {
     return;
   }
 
+  // Prevent duplicate handler registration
+  if (pagesWithHandlers.has(targetPage)) {
+    return;
+  }
+
   targetPage.on("dialog", async (dialog) => {
     const message = dialog.message();
-    console.log(`   → Dialog appeared: "${message}" (auto-accept)`);
-    if (typeof dialog.isHandled === "function" && dialog.isHandled()) {
-      console.log("   → Dialog already handled, skipping auto-accept.");
-      return;
-    }
+    const type = dialog.type();
+    console.log(`   → Dialog appeared [${type}]: "${message}" (auto-accept)`);
     try {
       await dialog.accept();
+      console.log(`   → Dialog accepted successfully`);
     } catch (error) {
-      console.log(`   → Failed to accept dialog: ${error.message}`);
+      // Dialog may already be handled by another event listener
+      if (!error.message.includes("already handled")) {
+        console.log(`   → Failed to accept dialog: ${error.message}`);
+      }
     }
   });
+
+  pagesWithHandlers.add(targetPage);
 }
 
 async function gotoAndWait(url, options = {}) {
@@ -44,6 +55,10 @@ async function gotoAndWait(url, options = {}) {
   }
   const mergedOptions = { waitUntil: "domcontentloaded", ...options };
   const targetPath = new URL(url).pathname;
+
+  if (process.env.DEBUG) {
+    console.log(`   → Navigating to: ${targetPath}`);
+  }
 
   try {
     await page.goto(url, mergedOptions);
@@ -62,6 +77,9 @@ async function gotoAndWait(url, options = {}) {
   }
 
   await page.waitForTimeout(500);
+  if (process.env.DEBUG) {
+    console.log(`   → Navigation to ${targetPath} completed`);
+  }
 }
 
 async function ensurePage() {
@@ -133,6 +151,7 @@ async function loginThroughPopup() {
 
     await page.fill("#loginForm_username", process.env.OLIVER_USERNAME);
     await page.fill("#loginForm_password", process.env.OLIVER_PASSWORD);
+    console.log("   → Submitting login credentials...");
     await page.click('#dialogContent button[type="submit"]');
     submittedCredentials = true;
     break;
@@ -143,13 +162,16 @@ async function loginThroughPopup() {
     return false;
   }
 
+  console.log("   → Waiting for page to settle after login...");
   try {
-    await page.waitForLoadState("networkidle", { timeout: 15000 });
-  } catch (_) {
-    // Oliver keeps long-running requests around; ignore load state timeouts.
+    await page.waitForLoadState("load", { timeout: 10000 });
+    console.log("   → Page loaded.");
+  } catch (error) {
+    console.log(`   → Page load timeout: ${error.message}`);
   }
 
   await page.waitForTimeout(2000);
+  console.log("   → Checking login status...");
 
   const logoutVisible = await page
     .waitForSelector("#window_logout", { timeout: 10000 })
@@ -163,6 +185,7 @@ async function loginThroughPopup() {
 
   console.log("   → Login confirmed; saving session.");
   await context.storageState({ path: SESSION_FILE });
+  console.log("   → Session saved, login complete.");
   return true;
 }
 
@@ -273,21 +296,43 @@ async function attemptMenuSmartCatalog(attempt = 1) {
       console.log("   → Login attempt unsuccessful.");
       return attemptMenuSmartCatalog(attempt + 1);
     }
-    await gotoAndWait(`${BASE_URL}/oliver/welcome.do`);
+    // Check if we're already on welcome page after login
+    const currentUrl = page.url();
+    if (!currentUrl.includes("/oliver/welcome.do")) {
+      console.log("   → Login successful, navigating to welcome page...");
+      await gotoAndWait(`${BASE_URL}/oliver/welcome.do`);
+    } else {
+      console.log("   → Login successful, already on welcome page.");
+    }
+    console.log("   → Waiting for page to fully initialize...");
+    await page.waitForTimeout(3000); // Give page time to fully load and initialize menus
   }
 
+  console.log("   → Checking for cataloguing menu...");
   try {
     await page.waitForSelector("#menu_cataloguing", {
       timeout: 20000,
     });
+    console.log("   → Cataloguing menu found!");
   } catch (_) {
-    console.log("   → Cataloguing menu not visible, refreshing welcome page...");
+    console.log(
+      "   → Cataloguing menu not visible, refreshing welcome page..."
+    );
     await page.reload({ waitUntil: "domcontentloaded" }).catch(async () => {
       await gotoAndWait(`${BASE_URL}/oliver/welcome.do`);
     });
-    await page.waitForSelector("#menu_cataloguing", {
-      timeout: 20000,
-    });
+
+    // Try again after refresh, retry the whole function if still not visible
+    try {
+      await page.waitForSelector("#menu_cataloguing", {
+        timeout: 20000,
+      });
+    } catch (_) {
+      console.log(
+        "   → Cataloguing menu still not visible after refresh, retrying..."
+      );
+      return attemptMenuSmartCatalog(attempt + 1);
+    }
   }
 
   await page.keyboard.press("Escape").catch(() => {});
@@ -299,7 +344,9 @@ async function attemptMenuSmartCatalog(attempt = 1) {
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      console.log("   → Clicking Cataloguing menu to open dropdown...");
       await page.locator("#menu_cataloguing").click({ timeout: 5000 });
+      console.log("   → Cataloguing menu clicked successfully");
       break;
     } catch (error) {
       if (attempt === 3) {
@@ -312,12 +359,30 @@ async function attemptMenuSmartCatalog(attempt = 1) {
       await page.waitForTimeout(500);
     }
   }
-  await page.waitForTimeout(800);
-  await page.waitForSelector("#menuItem_smartCataloguing", {
-    timeout: 5000,
-    state: "visible",
-  });
-  await page.click("#menuItem_smartCataloguing");
+  console.log("   → Waiting for Smart Cataloguing menu item to appear...");
+  await page.waitForTimeout(1500);
+
+  // There are often 2 elements with this ID - one hidden, one visible
+  // We need to click the visible one (usually the last one)
+  const menuItems = await page.locator("#menuItem_smartCataloguing").all();
+  console.log(`   → Found ${menuItems.length} Smart Cataloguing menu items`);
+
+  let visibleItem = null;
+  for (const item of menuItems) {
+    const isVisible = await item.isVisible();
+    if (isVisible) {
+      visibleItem = item;
+      console.log("   → Found visible Smart Cataloguing menu item");
+      break;
+    }
+  }
+
+  if (!visibleItem) {
+    throw new Error("No visible Smart Cataloguing menu item found");
+  }
+
+  console.log("   → Clicking visible Smart Cataloguing menu item...");
+  await visibleItem.click();
 
   const popup = await popupPromise;
   if (popup) {
@@ -335,7 +400,9 @@ async function attemptMenuSmartCatalog(attempt = 1) {
     .isVisible(LOGIN_LINK_SELECTOR)
     .catch(() => false);
   if (loginVisible) {
-    console.log("   → Menu navigation landed on login page, re-authenticating...");
+    console.log(
+      "   → Menu navigation landed on login page, re-authenticating..."
+    );
     const loginSuccess = await loginThroughPopup();
     if (!loginSuccess) {
       console.log("   → Login dialog failed during menu fallback.");
@@ -361,7 +428,9 @@ async function attemptMenuSmartCatalog(attempt = 1) {
     await page.waitForSelector("#smartCatSearchTerm", { timeout: 15000 });
     return true;
   } catch (_) {
-    console.log("   → Smart Cataloguing page incomplete after menu navigation.");
+    console.log(
+      "   → Smart Cataloguing page incomplete after menu navigation."
+    );
     await page.waitForTimeout(1000);
     return attemptMenuSmartCatalog(attempt + 1);
   }
@@ -386,7 +455,7 @@ async function searchSmartCataloguing(isbn, attempt = 1) {
 
   try {
     await page.waitForSelector("#smartCatSearchTerm", { timeout: 15000 });
-  } catch (error) {
+  } catch {
     console.log("   → Search field unavailable, reloading page...");
     const reNav = await navigateToSmartCataloguing();
     if (!reNav) {
@@ -479,7 +548,7 @@ async function processISBN(isbn) {
         await saveButton.click();
 
         try {
-          await page.waitForLoadState("networkidle", { timeout: 10000 });
+          await page.waitForLoadState("load", { timeout: 8000 });
         } catch (_) {
           // Ignore load-state timeouts; data saves even if background polling continues.
         }
@@ -497,7 +566,7 @@ async function processISBN(isbn) {
     return { isbn, status: "UNKNOWN" };
   } catch (error) {
     console.error(`❌ Error processing ISBN ${isbn}: ${error.message}`);
-    if (page?.isClosed && page.isClosed()) {
+    if (page?.isClosed?.()) {
       console.log(
         "   → Page closed unexpectedly; it will be recreated on the next iteration."
       );
@@ -525,9 +594,19 @@ async function runOliverAutomation(isbns) {
 
   console.log(`Processing ${isbns.length} ISBN(s)...`);
 
+  const headless =
+    process.env.HEADLESS === "true" || process.env.HEADLESS === "1";
+  if (headless) {
+    console.log("Running in headless mode (browser will not be visible)");
+  } else {
+    console.log(
+      "Running with visible browser (use HEADLESS=true to run headlessly)"
+    );
+  }
+
   browser = await chromium.launch({
-    headless: false,
-    slowMo: 100,
+    headless: headless,
+    slowMo: headless ? 0 : 100, // No slowMo in headless mode for better performance
   });
 
   const hasSession = existsSync(SESSION_FILE);
@@ -562,7 +641,7 @@ async function runOliverAutomation(isbns) {
       results.push(result);
     }
 
-    console.log("\n" + "=".repeat(70));
+    console.log("\n=".repeat(70));
     console.log("PROCESSING COMPLETE - REPORT");
     console.log("=".repeat(70));
 
@@ -574,36 +653,46 @@ async function runOliverAutomation(isbns) {
 
     console.log(`\n✅ ADDED (${added.length}):`);
     if (added.length > 0) {
-      added.forEach((r) => console.log(`   - ${r.isbn}`));
+      added.forEach((r) => {
+        console.log(`   - ${r.isbn}`);
+      });
     } else {
       console.log("   None");
     }
 
     console.log(`\n⏭️  ALREADY EXISTS (${alreadyExists.length}):`);
     if (alreadyExists.length > 0) {
-      alreadyExists.forEach((r) => console.log(`   - ${r.isbn}`));
+      alreadyExists.forEach((r) => {
+        console.log(`   - ${r.isbn}`);
+      });
     } else {
       console.log("   None");
     }
 
     console.log(`\n❌ NOT FOUND (${notFound.length}):`);
     if (notFound.length > 0) {
-      notFound.forEach((r) => console.log(`   - ${r.isbn}`));
+      notFound.forEach((r) => {
+        console.log(`   - ${r.isbn}`);
+      });
     } else {
       console.log("   None");
     }
 
     if (errors.length > 0) {
       console.log(`\n❌ ERRORS (${errors.length}):`);
-      errors.forEach((r) => console.log(`   - ${r.isbn}: ${r.error}`));
+      errors.forEach((r) => {
+        console.log(`   - ${r.isbn}: ${r.error}`);
+      });
     }
 
     if (unknown.length > 0) {
       console.log(`\n⚠️  UNKNOWN (${unknown.length}):`);
-      unknown.forEach((r) => console.log(`   - ${r.isbn}`));
+      unknown.forEach((r) => {
+        console.log(`   - ${r.isbn}`);
+      });
     }
 
-    console.log("\n" + "=".repeat(70));
+    console.log("\n=".repeat(70));
     console.log(
       `Total: ${results.length} | Added: ${added.length} | Already Exists: ${alreadyExists.length} | Not Found: ${notFound.length}`
     );
