@@ -1,5 +1,6 @@
 {
   "name": "oliver-uploader",
+  "type": "module",
   "version": "1.0.0",
   "description": "Web automation tool for Oliver library system",
   "main": "index.js",
@@ -8,7 +9,11 @@
     "search": "node index.js",
     "api": "node index-api.js"
   },
-  "keywords": ["automation", "oliver", "library"],
+  "keywords": [
+    "automation",
+    "oliver",
+    "library"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
